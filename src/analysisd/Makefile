@@ -7,6 +7,9 @@ NAME=ossec-analysisd
 
 include ../Config.Make
 
+CFLAGS += ${CSQLITE}
+CGEOIPLIB += ${CSQLITELIB}
+
 OTHER   = stats.c lists.c lists_list.c rules.c rules_list.c config.c fts.c dodiff.c eventinfo.c eventinfo_list.c cleanevent.c active-response.c picviz.c prelude.c zeromq_output.c compiled_rules/*.o ${OS_CONFIG}
 LOCAL   = analysisd.c ${OTHER}
 PLUGINS = decoders/decoders.a
@@ -29,7 +32,7 @@ logtest:
 	    cd ./cdb; make
 		cd ./decoders; make logtest
 		cd ./compiled_rules; make;
-		$(CC) $(CFLAGS) ${OS_LINK} -DTESTRULE -I./ testrule.c ${loga_OBJS} ${CGEOIPLIB} -o ossec-logtest 
+		$(CC) $(CFLAGS) ${OS_LINK} -DTESTRULE -I./ testrule.c ${loga_OBJS} ${CGEOIPLIB} -o ossec-logtest
 
 makelists:
 		cd ./cdb; make
