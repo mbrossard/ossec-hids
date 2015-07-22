@@ -232,6 +232,7 @@ int main(int argc, char **argv)
                 snprintf(full_path, OS_MAXSTR,"%s/%s", SYSCHECK_DIR,
                          entry->d_name);
 
+#ifndef SQLITE
                 fp = fopen(full_path, "w");
                 if(fp)
                 {
@@ -241,6 +242,10 @@ int main(int argc, char **argv)
                 {
                     unlink(full_path);
                 }
+
+#else
+                unlink(full_path);
+#endif
             }
 
             closedir(sys_dir);
@@ -253,6 +258,7 @@ int main(int argc, char **argv)
         {
             char final_dir[1024];
             FILE *fp;
+#ifndef SQLITE
             snprintf(final_dir, 1020, "/%s/syscheck", SYSCHECK_DIR);
 
             fp = fopen(final_dir, "w");
@@ -261,7 +267,11 @@ int main(int argc, char **argv)
                 fclose(fp);
             }
             unlink(final_dir);
-
+#else
+            /* Should push this down to delete_syscheck(NULL, NULL, 1) */
+            snprintf(final_dir, 1020, "/%s/syscheck.sqlite3", SYSCHECK_DIR);
+            unlink(final_dir);
+#endif
 
             /* Deleting cpt file */
             snprintf(final_dir, 1020, "/%s/.syscheck.cpt", SYSCHECK_DIR);

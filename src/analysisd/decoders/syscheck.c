@@ -187,15 +187,13 @@ void DB_SetCompleted(Eventinfo *lf)
     }
 }
 
-
 /* DB_File
  * Return the file pointer to be used to verify the integrity
  */
-#ifdef SQLITE
-static sqlite3 *DB_File(const char *agent, int *agent_id)
-#else
-static FILE *DB_File(const char *agent, int *agent_id)
-#endif
+
+#ifndef SQLITE
+
+FILE *DB_File(char *agent, int *agent_id)
 {
     int i = 0;
 
@@ -205,13 +203,9 @@ static FILE *DB_File(const char *agent, int *agent_id)
         if(strcmp(sdb.agent_ips[i], agent) == 0)
         {
             /* Pointing to the beginning of the file */
+            fseek(sdb.agent_fps[i],0, SEEK_SET);
             *agent_id = i;
-#ifdef SQLITE
-            return (sdb.agent_dbs[i]);
-#else
-            fseek(sdb.agent_fps[i], 0, SEEK_SET);
-            return (sdb.agent_fps[i]);
-#endif
+            return(sdb.agent_fps[i]);
         }
 
         i++;
@@ -226,51 +220,6 @@ static FILE *DB_File(const char *agent, int *agent_id)
 
     os_strdup(agent, sdb.agent_ips[i]);
 
-
-#ifdef SQLITE
-    /* Get agent file */
-    snprintf(sdb.buf, OS_FLSIZE , "%s/%s.sqlite3", SYSCHECK_DIR, agent);
-
-    /* Check if file exists */
-    FILE *f = fopen(sdb.buf, "r");
-    int schema = 1;
-    if(f) {
-        /* Database already exists */
-        schema = 0;
-        fclose(f);
-    }
-    sqlite3_open(sdb.buf, &(sdb.agent_dbs[i]));
-
-    /* Check again */
-    if (!sdb.agent_dbs[i]) {
-        merror("%s: Unable to open '%s'", ARGV0, sdb.buf);
-
-        free(sdb.agent_ips[i]);
-        sdb.agent_ips[i] = NULL;
-        return (NULL);
-    }
-
-    if(schema) {
-        if((sqlite3_exec(sdb.agent_dbs[i], "CREATE TABLE files(name text, csum text);", 0,0,0) != SQLITE_OK) ||
-           (sqlite3_exec(sdb.agent_dbs[i], "CREATE UNIQUE INDEX file_idx ON files(name);", 0,0,0) != SQLITE_OK)) {
-            merror("%s: Error creating schema '%s'", ARGV0, sdb.buf);
-
-            free(sdb.agent_ips[i]);
-            sdb.agent_ips[i] = NULL;
-            return (NULL);
-        }
-    }
-
-    *agent_id = i;
-
-    /* Check if the agent was completed */
-    if (__iscompleted(agent)) {
-        sdb.agent_cp[i][0] = '1';
-    }
-
-    return (sdb.agent_dbs[i]);
-
-#else
 
     /* Getting agent file */
     snprintf(sdb.buf, OS_FLSIZE , "%s/%s", SYSCHECK_DIR,agent);
@@ -312,8 +261,85 @@ static FILE *DB_File(const char *agent, int *agent_id)
     }
 
     return(sdb.agent_fps[i]);
-#endif
 }
+
+#else
+
+sqlite3 *DB_File(const char *agent, int *agent_id)
+{
+    int i = 0;
+
+    /* Finding file pointer */
+    while(sdb.agent_ips[i] != NULL  &&  i < MAX_AGENTS)
+    {
+        if(strcmp(sdb.agent_ips[i], agent) == 0)
+        {
+            /* Pointing to the beginning of the file */
+            *agent_id = i;
+            return (sdb.agent_dbs[i]);
+        }
+
+        i++;
+    }
+
+    /* If here, our agent wasn't found */
+    if (i == MAX_AGENTS)
+    {
+        merror("%s: Unable to open integrity file. Increase MAX_AGENTS.",ARGV0);
+        return(NULL);
+    }
+
+    os_strdup(agent, sdb.agent_ips[i]);
+
+    /* Get agent file */
+    snprintf(sdb.buf, OS_FLSIZE , "%s/%s.sqlite3", SYSCHECK_DIR, agent);
+
+    /* Check if file exists */
+    FILE *f = fopen(sdb.buf, "r");
+    int schema = 1;
+    if(f) {
+        /* Database already exists */
+        schema = 0;
+        fclose(f);
+    }
+    sqlite3_open(sdb.buf, &(sdb.agent_dbs[i]));
+
+    /* Check again */
+    if (!sdb.agent_dbs[i]) {
+        merror("%s: Unable to open '%s'", ARGV0, sdb.buf);
+
+        free(sdb.agent_ips[i]);
+        sdb.agent_ips[i] = NULL;
+        return (NULL);
+    }
+
+    if(schema) {
+        char *schema[2] = {
+            "CREATE TABLE files(name TEXT, csum TEXT, previous TEXT DEFAULT NULL,"
+            " date INTEGER DEFAULT 0, changes INTEGER DEFAULT 0);",
+            "CREATE UNIQUE INDEX file_idx ON files(name);"
+        };
+        if((sqlite3_exec(sdb.agent_dbs[i], schema[0], 0, 0, 0) != SQLITE_OK) ||
+           (sqlite3_exec(sdb.agent_dbs[i], schema[1], 0,0,0) != SQLITE_OK)) {
+            merror("%s: Error creating schema '%s'", ARGV0, sdb.buf);
+
+            free(sdb.agent_ips[i]);
+            sdb.agent_ips[i] = NULL;
+            return (NULL);
+        }
+    }
+
+    *agent_id = i;
+
+    /* Check if the agent was completed */
+    if (__iscompleted(agent)) {
+        sdb.agent_cp[i][0] = '1';
+    }
+
+    return (sdb.agent_dbs[i]);
+}
+
+#endif
 
 void interpret_changes(const char *f_name, const char *c_sum, char *saved_sum, Eventinfo *lf)
 {
@@ -548,64 +574,13 @@ void interpret_changes(const char *f_name, const char *c_sum, char *saved_sum, E
 /* DB_Search
  * Search the DB for any entry related to the file being received
  */
+
+#ifndef SQLITE
+
 int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
 {
     int agent_id;
     char *saved_sum;
-
-#ifdef SQLITE
-    sqlite3 *db;
-    char stmt[OS_MAXSTR + 1];
-    sqlite3_stmt *res = NULL;
-    const char *tail;
-    int error = 0;
-    /* Get db pointer */
-    db = DB_File(lf->location, &agent_id);
-    if (!db) {
-        merror("%s: Error handling integrity database.", ARGV0);
-        sdb.db_err++;
-        lf->data = NULL;
-        return (0);
-    }
-
-    sprintf(stmt, "SELECT csum FROM files where name = ?;");
-	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) &&
-        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) == SQLITE_OK)) {
-        if((error = sqlite3_step(res)) == SQLITE_ROW) {
-            const char *tmp = (const char *) sqlite3_column_text(res, 0);
-            strncpy(sdb.buf, tmp, OS_MAXSTR);
-            saved_sum = sdb.buf;
-
-            if (strcmp(saved_sum, c_sum) == 0) {
-                sqlite3_finalize(res);
-                lf->data = NULL;
-                return (0);
-            }
-            sqlite3_finalize(res);
-
-            sprintf(stmt, "UPDATE files SET csum = ? WHERE name = ?;");
-            if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
-                ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
-                ((error = sqlite3_bind_text(res, 2, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) || 
-                ((error = sqlite3_step(res)) != SQLITE_DONE)) {
-                merror("%s: Error updating file %s into database.", ARGV0, f_name);
-                sdb.db_err++;
-                sqlite3_finalize(res);
-                lf->data = NULL;
-                return (0);
-            }
-
-            interpret_changes(f_name, c_sum, saved_sum, lf);
-        }
-    } else if(res) {
-        sqlite3_finalize(res);
-        merror("%s: Error searching database.", ARGV0);
-        sdb.db_err++;
-        lf->data = NULL;
-        return (0);
-    }
-
-#else
 
     int p = 0;
     int sn_size;
@@ -769,24 +744,6 @@ int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
         return (1);
 
     } /* continuiing... */
-#endif
-
-#ifdef SQLITE
-    /* New file */
-    sprintf(stmt, "INSERT INTO files(name, csum) VALUES(?, ?)");
-	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
-        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
-        ((error = sqlite3_bind_text(res, 2, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) ||
-        ((error = sqlite3_step(res)) != SQLITE_DONE)) {
-        merror("%s: Error inserting file %s into database.", ARGV0, f_name);
-        sdb.db_err++;
-        sqlite3_finalize(res);
-        lf->data = NULL;
-        return (0);
-    }
-    sqlite3_finalize(res);
-
-#else
 
     /* If we reach here, this file is not present on our database */
     fseek(fp, 0, SEEK_END);
@@ -794,8 +751,6 @@ int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
     fprintf(fp,"+++%s !%d %s\n", c_sum, lf->time, f_name);
 
     fflush(fp);
-
-#endif
 
     /* Alert if configured to notify on new files */
     if((Config.syscheck_alert_new == 1) && (DB_IsCompleted(agent_id)))
@@ -825,6 +780,129 @@ int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
     return(0);
 }
 
+#else
+
+int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
+{
+    int agent_id;
+
+    sqlite3 *db;
+    char stmt[OS_MAXSTR + 1];
+    sqlite3_stmt *res = NULL;
+    const char *tail;
+    int error = 0;
+    /* Get db pointer */
+    db = DB_File(lf->location, &agent_id);
+    if (!db) {
+        merror("%s: Error handling integrity database.", ARGV0);
+        sdb.db_err++;
+        lf->data = NULL;
+        return (0);
+    }
+
+    sprintf(stmt, "SELECT csum, changes FROM files where name = ?;");
+	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) &&
+        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) == SQLITE_OK)) {
+        if((error = sqlite3_step(res)) == SQLITE_ROW) {
+            char saved_sum[OS_MAXSTR + 1];
+            int changes = sqlite3_column_int(res, 1);
+            const char *tmp = (const char *) sqlite3_column_text(res, 0);
+            strncpy(saved_sum, tmp, OS_MAXSTR);
+            sqlite3_finalize(res);
+
+            if (strcmp(saved_sum, c_sum) == 0) {
+                /* It's a match */
+                lf->data = NULL;
+                return (0);
+            }
+
+            /* Checking the number of changes */
+            if(!Config.syscheck_auto_ignore) {
+                sdb.syscheck_dec->id = sdb.id1;
+            } else {
+                if(changes > 2 || changes < 0) {
+                    lf->data = NULL;
+                    return(0);
+                } else {
+                    int ids[3] = { sdb.id1, sdb.id2, sdb.id3 };
+                    sdb.syscheck_dec->id = ids[changes];
+                }
+            }
+            if(changes < 4) {
+                changes += 1;
+            }
+
+            sprintf(stmt, "UPDATE files SET previous = csum, csum = ?, changes = ?, date = ? WHERE name = ?;");
+            if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_text(res, 1, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) || 
+                ((error = sqlite3_bind_int(res, 2, changes)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_int(res, 3, lf->time)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_text(res, 4, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
+                ((error = sqlite3_step(res)) != SQLITE_DONE)) {
+                merror("%s: Error updating file %s into database.", ARGV0, f_name);
+                sdb.db_err++;
+                sqlite3_finalize(res);
+                lf->data = NULL;
+                return (0);
+            }
+
+            interpret_changes(f_name, c_sum, saved_sum, lf);
+            return (1);
+        }
+    } else if(res) {
+        sqlite3_finalize(res);
+        merror("%s: Error searching database.", ARGV0);
+        sdb.db_err++;
+        lf->data = NULL;
+        return (0);
+    }
+
+    /* New file */
+    sprintf(stmt, "INSERT INTO files(name, csum, date) VALUES(?, ?, ?)");
+	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_text(res, 2, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_int(res, 3, lf->time)) != SQLITE_OK) ||
+        ((error = sqlite3_step(res)) != SQLITE_DONE)) {
+        merror("%s: Error inserting file << %s >> (%zu) with checksum << %s >> (%zu) and date %d into database.",
+               ARGV0, f_name, strlen(f_name), c_sum, strlen(c_sum), lf->time);
+        merror("%s: SQLite database error was: %s", ARGV0, sqlite3_errmsg(db));
+        sdb.db_err++;
+        sqlite3_finalize(res);
+        lf->data = NULL;
+        return (0);
+    }
+    sqlite3_finalize(res);
+
+    /* Alert if configured to notify on new files */
+    if((Config.syscheck_alert_new == 1) && (DB_IsCompleted(agent_id)))
+    {
+        sdb.syscheck_dec->id = sdb.idn;
+
+        /* New file message */
+        snprintf(sdb.comment, OS_MAXSTR,
+                              "New file '%.756s' "
+                              "added to the file system.", f_name);
+
+
+        /* Creating a new log message */
+        free(lf->full_log);
+        os_strdup(sdb.comment, lf->full_log);
+        lf->log = lf->full_log;
+
+
+        /* Setting decoder */
+        lf->decoder_info = sdb.syscheck_dec;
+        lf->data = NULL;
+
+        return(1);
+    }
+
+    lf->data = NULL;
+    return(0);
+}
+
+#endif
 
 /* Special decoder for syscheck
  * Not using the default decoding lib for simplicity
