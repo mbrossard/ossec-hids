@@ -19,6 +19,9 @@
 #include "alerts/alerts.h"
 #include "decoder.h"
 
+#ifdef SQLITE
+#include <sqlite3.h>
+#endif
 
 typedef struct __sdb
 {
@@ -34,7 +37,11 @@ typedef struct __sdb
 
     char agent_cp[MAX_AGENTS +1][1];
     char *agent_ips[MAX_AGENTS +1];
-    FILE *agent_fps[MAX_AGENTS +1];
+#ifdef SQLITE
+    sqlite3 *agent_dbs[MAX_AGENTS + 1];
+#else
+    FILE *agent_fps[MAX_AGENTS + 1];
+#endif
 
     int db_err;
 
@@ -74,7 +81,11 @@ void SyscheckInit()
     for(;i <= MAX_AGENTS;i++)
     {
         sdb.agent_ips[i] = NULL;
+#ifdef SQLITE
+        sdb.agent_dbs[i] = NULL;
+#else
         sdb.agent_fps[i] = NULL;
+#endif
         sdb.agent_cp[i][0] = '0';
     }
 
@@ -176,10 +187,12 @@ void DB_SetCompleted(Eventinfo *lf)
     }
 }
 
-
 /* DB_File
  * Return the file pointer to be used to verify the integrity
  */
+
+#ifndef SQLITE
+
 FILE *DB_File(char *agent, int *agent_id)
 {
     int i = 0;
@@ -250,17 +263,328 @@ FILE *DB_File(char *agent, int *agent_id)
     return(sdb.agent_fps[i]);
 }
 
+#else
+
+sqlite3 *DB_File(const char *agent, int *agent_id)
+{
+    int i = 0;
+
+    /* Finding file pointer */
+    while(sdb.agent_ips[i] != NULL  &&  i < MAX_AGENTS)
+    {
+        if(strcmp(sdb.agent_ips[i], agent) == 0)
+        {
+            /* Pointing to the beginning of the file */
+            *agent_id = i;
+            return (sdb.agent_dbs[i]);
+        }
+
+        i++;
+    }
+
+    /* If here, our agent wasn't found */
+    if (i == MAX_AGENTS)
+    {
+        merror("%s: Unable to open integrity file. Increase MAX_AGENTS.",ARGV0);
+        return(NULL);
+    }
+
+    os_strdup(agent, sdb.agent_ips[i]);
+
+    /* Get agent file */
+    snprintf(sdb.buf, OS_FLSIZE , "%s/%s.sqlite3", SYSCHECK_DIR, agent);
+
+    /* Check if file exists */
+    FILE *f = fopen(sdb.buf, "r");
+    int schema = 1;
+    if(f) {
+        /* Database already exists */
+        schema = 0;
+        fclose(f);
+    }
+    sqlite3_open(sdb.buf, &(sdb.agent_dbs[i]));
+
+    /* Check again */
+    if (!sdb.agent_dbs[i]) {
+        merror("%s: Unable to open '%s'", ARGV0, sdb.buf);
+
+        free(sdb.agent_ips[i]);
+        sdb.agent_ips[i] = NULL;
+        return (NULL);
+    }
+
+    if(schema) {
+        char *schema[2] = {
+            "CREATE TABLE files(name TEXT, csum TEXT, previous TEXT DEFAULT NULL,"
+            " date INTEGER DEFAULT 0, changes INTEGER DEFAULT 0);",
+            "CREATE UNIQUE INDEX file_idx ON files(name);"
+        };
+        if((sqlite3_exec(sdb.agent_dbs[i], schema[0], 0, 0, 0) != SQLITE_OK) ||
+           (sqlite3_exec(sdb.agent_dbs[i], schema[1], 0,0,0) != SQLITE_OK)) {
+            merror("%s: Error creating schema '%s'", ARGV0, sdb.buf);
+
+            free(sdb.agent_ips[i]);
+            sdb.agent_ips[i] = NULL;
+            return (NULL);
+        }
+    }
+
+    *agent_id = i;
+
+    /* Check if the agent was completed */
+    if (__iscompleted(agent)) {
+        sdb.agent_cp[i][0] = '1';
+    }
+
+    return (sdb.agent_dbs[i]);
+}
+
+#endif
+
+void interpret_changes(const char *f_name, const char *c_sum, char *saved_sum, Eventinfo *lf)
+{
+    /* File deleted */
+    if (c_sum[0] == '-' && c_sum[1] == '1') {
+        sdb.syscheck_dec->id = sdb.idd;
+        snprintf(sdb.comment, OS_MAXSTR,
+                 "File '%.756s' was deleted. Unable to retrieve "
+                 "checksum.", f_name);
+    }
+
+    /* If file was re-added, do not compare changes */
+    else if (saved_sum[0] == '-' && saved_sum[1] == '1') {
+        sdb.syscheck_dec->id = sdb.idn;
+        snprintf(sdb.comment, OS_MAXSTR,
+                 "File '%.756s' was re-added.", f_name);
+    }
+
+    else {
+        int oldperm = 0, newperm = 0;
+
+        /* Provide more info about the file change */
+        const char *oldsize = NULL, *newsize = NULL;
+        char *olduid = NULL, *newuid = NULL;
+        char *c_oldperm = NULL, *c_newperm = NULL;
+        char *oldgid = NULL, *newgid = NULL;
+        char *oldmd5 = NULL, *newmd5 = NULL;
+        char *oldsha1 = NULL, *newsha1 = NULL;
+
+        oldsize = saved_sum;
+        newsize = c_sum;
+
+        c_oldperm = strchr(saved_sum, ':');
+        c_newperm = strchr(c_sum, ':');
+
+        /* Get old/new permissions */
+        if (c_oldperm && c_newperm) {
+            *c_oldperm = '\0';
+            c_oldperm++;
+
+            *c_newperm = '\0';
+            c_newperm++;
+
+            /* Get old/new uid/gid */
+            olduid = strchr(c_oldperm, ':');
+            newuid = strchr(c_newperm, ':');
+
+            if (olduid && newuid) {
+                *olduid = '\0';
+                *newuid = '\0';
+                olduid++;
+                newuid++;
+
+                oldgid = strchr(olduid, ':');
+                newgid = strchr(newuid, ':');
+
+                if (oldgid && newgid) {
+                    *oldgid = '\0';
+                    *newgid = '\0';
+                    oldgid++;
+                    newgid++;
+
+                    /* Get MD5 */
+                    oldmd5 = strchr(oldgid, ':');
+                    newmd5 = strchr(newgid, ':');
+
+                    if (oldmd5 && newmd5) {
+                        *oldmd5 = '\0';
+                        *newmd5 = '\0';
+                        oldmd5++;
+                        newmd5++;
+
+                        /* Get SHA-1 */
+                        oldsha1 = strchr(oldmd5, ':');
+                        newsha1 = strchr(newmd5, ':');
+
+                        if (oldsha1 && newsha1) {
+                            *oldsha1 = '\0';
+                            *newsha1 = '\0';
+                            oldsha1++;
+                            newsha1++;
+                        }
+                    }
+                    }
+            }
+        }
+
+        /* Get integer values */
+        if (c_newperm && c_oldperm) {
+            newperm = atoi(c_newperm);
+            oldperm = atoi(c_oldperm);
+        }
+
+        /* Generate size message */
+        if (!oldsize || !newsize || strcmp(oldsize, newsize) == 0) {
+            sdb.size[0] = '\0';
+        } else {
+            snprintf(sdb.size, OS_FLSIZE,
+                     "Size changed from '%s' to '%s'\n",
+                     oldsize, newsize);
+
+            os_strdup(oldsize, lf->size_before);
+            os_strdup(newsize, lf->size_after);
+        }
+
+        /* Permission message */
+        if (oldperm == newperm) {
+            sdb.perm[0] = '\0';
+        } else if (oldperm > 0 && newperm > 0) {
+
+            snprintf(sdb.perm, OS_FLSIZE, "Permissions changed from "
+                     "'%c%c%c%c%c%c%c%c%c' "
+                     "to '%c%c%c%c%c%c%c%c%c'\n",
+                     (oldperm & S_IRUSR) ? 'r' : '-',
+                     (oldperm & S_IWUSR) ? 'w' : '-',
+
+                     (oldperm & S_ISUID) ? 's' :
+                     (oldperm & S_IXUSR) ? 'x' : '-',
+
+                     (oldperm & S_IRGRP) ? 'r' : '-',
+                     (oldperm & S_IWGRP) ? 'w' : '-',
+
+                     (oldperm & S_ISGID) ? 's' :
+                     (oldperm & S_IXGRP) ? 'x' : '-',
+
+                     (oldperm & S_IROTH) ? 'r' : '-',
+                     (oldperm & S_IWOTH) ? 'w' : '-',
+
+                     (oldperm & S_ISVTX) ? 't' :
+                     (oldperm & S_IXOTH) ? 'x' : '-',
+
+                     (newperm & S_IRUSR) ? 'r' : '-',
+                     (newperm & S_IWUSR) ? 'w' : '-',
+
+                     (newperm & S_ISUID) ? 's' :
+                     (newperm & S_IXUSR) ? 'x' : '-',
+
+                     (newperm & S_IRGRP) ? 'r' : '-',
+                     (newperm & S_IWGRP) ? 'w' : '-',
+
+                     (newperm & S_ISGID) ? 's' :
+                     (newperm & S_IXGRP) ? 'x' : '-',
+
+                     (newperm & S_IROTH) ? 'r' : '-',
+                     (newperm & S_IWOTH) ? 'w' : '-',
+
+                     (newperm & S_ISVTX) ? 't' :
+                     (newperm & S_IXOTH) ? 'x' : '-');
+
+            lf->perm_before = oldperm;
+            lf->perm_after = newperm;
+        }
+
+        /* Ownership message */
+        if (!newuid || !olduid || strcmp(newuid, olduid) == 0) {
+            sdb.owner[0] = '\0';
+        } else {
+                snprintf(sdb.owner, OS_FLSIZE, "Ownership was '%s', "
+                         "now it is '%s'\n",
+                         olduid, newuid);
+
+                os_strdup(olduid, lf->owner_before);
+                os_strdup(newuid, lf->owner_after);
+        }
+
+        /* Group ownership message */
+        if (!newgid || !oldgid || strcmp(newgid, oldgid) == 0) {
+                sdb.gowner[0] = '\0';
+        } else {
+            snprintf(sdb.gowner, OS_FLSIZE, "Group ownership was '%s', "
+                     "now it is '%s'\n",
+                     oldgid, newgid);
+            os_strdup(oldgid, lf->gowner_before);
+            os_strdup(newgid, lf->gowner_after);
+        }
+
+        /* MD5 message */
+        if (!newmd5 || !oldmd5 || strcmp(newmd5, oldmd5) == 0) {
+            sdb.md5[0] = '\0';
+        } else {
+            snprintf(sdb.md5, OS_FLSIZE, "Old md5sum was: '%s'\n"
+                     "New md5sum is : '%s'\n",
+                     oldmd5, newmd5);
+            os_strdup(oldmd5, lf->md5_before);
+            os_strdup(newmd5, lf->md5_after);
+        }
+
+        /* SHA-1 message */
+        if (!newsha1 || !oldsha1 || strcmp(newsha1, oldsha1) == 0) {
+            sdb.sha1[0] = '\0';
+        } else {
+            snprintf(sdb.sha1, OS_FLSIZE, "Old sha1sum was: '%s'\n"
+                     "New sha1sum is : '%s'\n",
+                     oldsha1, newsha1);
+            os_strdup(oldsha1, lf->sha1_before);
+            os_strdup(newsha1, lf->sha1_after);
+        }
+        os_strdup(f_name, lf->filename);
+
+        /* Provide information about the file */
+        snprintf(sdb.comment, OS_MAXSTR, "Integrity checksum changed for: "
+                 "'%.756s'\n"
+                 "%s"
+                 "%s"
+                 "%s"
+                 "%s"
+                 "%s"
+                 "%s"
+                 "%s%s",
+                 f_name,
+                 sdb.size,
+                 sdb.perm,
+                 sdb.owner,
+                 sdb.gowner,
+                 sdb.md5,
+                 sdb.sha1,
+                 lf->data == NULL ? "" : "What changed:\n",
+                 lf->data == NULL ? "" : lf->data
+        );
+    }
+
+    /* Create a new log message */
+    free(lf->full_log);
+    os_strdup(sdb.comment, lf->full_log);
+    lf->log = lf->full_log;
+    lf->data = NULL;
+
+    /* Set decoder */
+    lf->decoder_info = sdb.syscheck_dec;
+}
 
 /* DB_Search
  * Search the DB for any entry related to the file being received
  */
+
+#ifndef SQLITE
+
 int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
 {
+    int agent_id;
+    char *saved_sum;
+
     int p = 0;
     int sn_size;
-    int agent_id;
 
-    char *saved_sum;
     char *saved_name;
 
     FILE *fp;
@@ -416,278 +740,10 @@ int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
                 f_name);
         fflush(fp);
 
-
-        /* File deleted */
-        if(c_sum[0] == '-' && c_sum[1] == '1')
-        {
-            sdb.syscheck_dec->id = sdb.idd;
-            snprintf(sdb.comment, OS_MAXSTR,
-                    "File '%.756s' was deleted. Unable to retrieve "
-                    "checksum.", f_name);
-        }
-
-        /* If file was re-added, do not compare changes */
-        else if(saved_sum[0] == '-' && saved_sum[1] == '1')
-        {
-            sdb.syscheck_dec->id = sdb.idn;
-            snprintf(sdb.comment, OS_MAXSTR,
-                     "File '%.756s' was re-added.", f_name);
-        }
-
-        else
-        {
-            int oldperm = 0, newperm = 0;
-
-            /* Providing more info about the file change */
-            char *oldsize = NULL, *newsize = NULL;
-            char *olduid = NULL, *newuid = NULL;
-            char *c_oldperm = NULL, *c_newperm = NULL;
-            char *oldgid = NULL, *newgid = NULL;
-            char *oldmd5 = NULL, *newmd5 = NULL;
-            char *oldsha1 = NULL, *newsha1 = NULL;
-
-            oldsize = saved_sum;
-            newsize = c_sum;
-
-            c_oldperm = strchr(saved_sum, ':');
-            c_newperm = strchr(c_sum, ':');
-
-            /* Get old/new permissions */
-            if(c_oldperm && c_newperm)
-            {
-                *c_oldperm = '\0';
-                c_oldperm++;
-
-                *c_newperm = '\0';
-                c_newperm++;
-
-                /* Get old/new uid/gid */
-                olduid = strchr(c_oldperm, ':');
-                newuid = strchr(c_newperm, ':');
-
-                if(olduid && newuid)
-                {
-                    *olduid = '\0';
-                    *newuid = '\0';
-
-                    olduid++;
-                    newuid++;
-
-                    oldgid = strchr(olduid, ':');
-                    newgid = strchr(newuid, ':');
-
-                    if(oldgid && newgid)
-                    {
-                        *oldgid = '\0';
-                        *newgid = '\0';
-
-                        oldgid++;
-                        newgid++;
-
-
-                        /* Getting md5 */
-                        oldmd5 = strchr(oldgid, ':');
-                        newmd5 = strchr(newgid, ':');
-
-                        if(oldmd5 && newmd5)
-                        {
-                            *oldmd5 = '\0';
-                            *newmd5 = '\0';
-
-                            oldmd5++;
-                            newmd5++;
-
-                            /* getting sha1 */
-                            oldsha1 = strchr(oldmd5, ':');
-                            newsha1 = strchr(newmd5, ':');
-
-                            if(oldsha1 && newsha1)
-                            {
-                                *oldsha1 = '\0';
-                                *newsha1 = '\0';
-
-                                oldsha1++;
-                                newsha1++;
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* Getting integer values */
-            if(c_newperm && c_oldperm)
-            {
-                newperm = atoi(c_newperm);
-                oldperm = atoi(c_oldperm);
-            }
-
-            /* Generating size message */
-            if(!oldsize || !newsize || strcmp(oldsize, newsize) == 0)
-            {
-                sdb.size[0] = '\0';
-            }
-            else
-            {
-                snprintf(sdb.size, OS_FLSIZE,
-                        "Size changed from '%s' to '%s'\n",
-                        oldsize, newsize);
-
-                os_strdup(oldsize, lf->size_before);
-                os_strdup(newsize, lf->size_after);
-            }
-
-            /* Permission message */
-            if(oldperm == newperm)
-            {
-                sdb.perm[0] = '\0';
-            }
-            else if(oldperm > 0 && newperm > 0)
-            {
-
-                snprintf(sdb.perm, OS_FLSIZE, "Permissions changed from "
-                        "'%c%c%c%c%c%c%c%c%c' "
-                        "to '%c%c%c%c%c%c%c%c%c'\n",
-                        (oldperm & S_IRUSR)? 'r' : '-',
-                        (oldperm & S_IWUSR)? 'w' : '-',
-
-                        (oldperm & S_ISUID)? 's' :
-                        (oldperm & S_IXUSR)? 'x' : '-',
-
-                        (oldperm & S_IRGRP)? 'r' : '-',
-                        (oldperm & S_IWGRP)? 'w' : '-',
-
-                        (oldperm & S_ISGID)? 's' :
-                        (oldperm & S_IXGRP)? 'x' : '-',
-
-                        (oldperm & S_IROTH)? 'r' : '-',
-                        (oldperm & S_IWOTH)? 'w' : '-',
-
-                        (oldperm & S_ISVTX)? 't' :
-                        (oldperm & S_IXOTH)? 'x' : '-',
-
-
-
-                        (newperm & S_IRUSR)? 'r' : '-',
-                        (newperm & S_IWUSR)? 'w' : '-',
-
-                        (newperm & S_ISUID)? 's' :
-                        (newperm & S_IXUSR)? 'x' : '-',
-
-
-                        (newperm & S_IRGRP)? 'r' : '-',
-                        (newperm & S_IWGRP)? 'w' : '-',
-
-                        (newperm & S_ISGID)? 's' :
-                        (newperm & S_IXGRP)? 'x' : '-',
-
-                        (newperm & S_IROTH)? 'r' : '-',
-                        (newperm & S_IWOTH)? 'w' : '-',
-
-                        (newperm & S_ISVTX)? 't' :
-                        (newperm & S_IXOTH)? 'x' : '-');
-
-                lf->perm_before = oldperm;
-                lf->perm_after = newperm;
-            }
-
-            /* Ownership message */
-            if(!newuid || !olduid || strcmp(newuid, olduid) == 0)
-            {
-                sdb.owner[0] = '\0';
-            }
-            else
-            {
-                snprintf(sdb.owner, OS_FLSIZE, "Ownership was '%s', "
-                        "now it is '%s'\n",
-                        olduid, newuid);
-
-
-                os_strdup(olduid, lf->owner_before);
-                os_strdup(newuid, lf->owner_after);
-            }
-
-            /* group ownership message */
-            if(!newgid || !oldgid || strcmp(newgid, oldgid) == 0)
-            {
-                sdb.gowner[0] = '\0';
-            }
-            else
-            {
-                snprintf(sdb.gowner, OS_FLSIZE,"Group ownership was '%s', "
-                        "now it is '%s'\n",
-                        oldgid, newgid);
-                os_strdup(oldgid, lf->gowner_before);
-                os_strdup(newgid, lf->gowner_after);
-            }
-
-            /* md5 message */
-            if(!newmd5 || !oldmd5 || strcmp(newmd5, oldmd5) == 0)
-            {
-                sdb.md5[0] = '\0';
-            }
-            else
-            {
-                snprintf(sdb.md5, OS_FLSIZE, "Old md5sum was: '%s'\n"
-                        "New md5sum is : '%s'\n",
-                        oldmd5, newmd5);
-                os_strdup(oldmd5, lf->md5_before);
-                os_strdup(newmd5, lf->md5_after);
-            }
-
-            /* sha1 */
-            if(!newsha1 || !oldsha1 || strcmp(newsha1, oldsha1) == 0)
-            {
-                sdb.sha1[0] = '\0';
-            }
-            else
-            {
-                snprintf(sdb.sha1, OS_FLSIZE, "Old sha1sum was: '%s'\n"
-                        "New sha1sum is : '%s'\n",
-                        oldsha1, newsha1);
-                os_strdup(oldsha1, lf->sha1_before);
-                os_strdup(newsha1, lf->sha1_after);
-            }
-            os_strdup(f_name, lf->filename);
-
-
-            /* Provide information about the file */
-            snprintf(sdb.comment, OS_MAXSTR, "Integrity checksum changed for: "
-                    "'%.756s'\n"
-                    "%s"
-                    "%s"
-                    "%s"
-                    "%s"
-                    "%s"
-                    "%s"
-                    "%s%s",
-                    f_name,
-                    sdb.size,
-                    sdb.perm,
-                    sdb.owner,
-                    sdb.gowner,
-                    sdb.md5,
-                    sdb.sha1,
-                    lf->data == NULL?"":"What changed:\n",
-                    lf->data == NULL?"":lf->data
-                    );
-        }
-
-
-        /* Creating a new log message */
-        free(lf->full_log);
-        os_strdup(sdb.comment, lf->full_log);
-        lf->log = lf->full_log;
-        lf->data = NULL;
-
-
-        /* Setting decoder */
-        lf->decoder_info = sdb.syscheck_dec;
-
-
-        return(1);
+        interpret_changes(f_name, c_sum, saved_sum, lf);
+        return (1);
 
     } /* continuiing... */
-
 
     /* If we reach here, this file is not present on our database */
     fseek(fp, 0, SEEK_END);
@@ -724,6 +780,129 @@ int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
     return(0);
 }
 
+#else
+
+int DB_Search(char *f_name, char *c_sum, Eventinfo *lf)
+{
+    int agent_id;
+
+    sqlite3 *db;
+    char stmt[OS_MAXSTR + 1];
+    sqlite3_stmt *res = NULL;
+    const char *tail;
+    int error = 0;
+    /* Get db pointer */
+    db = DB_File(lf->location, &agent_id);
+    if (!db) {
+        merror("%s: Error handling integrity database.", ARGV0);
+        sdb.db_err++;
+        lf->data = NULL;
+        return (0);
+    }
+
+    sprintf(stmt, "SELECT csum, changes FROM files where name = ?;");
+	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) &&
+        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) == SQLITE_OK)) {
+        if((error = sqlite3_step(res)) == SQLITE_ROW) {
+            char saved_sum[OS_MAXSTR + 1];
+            int changes = sqlite3_column_int(res, 1);
+            const char *tmp = (const char *) sqlite3_column_text(res, 0);
+            strncpy(saved_sum, tmp, OS_MAXSTR);
+            sqlite3_finalize(res);
+
+            if (strcmp(saved_sum, c_sum) == 0) {
+                /* It's a match */
+                lf->data = NULL;
+                return (0);
+            }
+
+            /* Checking the number of changes */
+            if(!Config.syscheck_auto_ignore) {
+                sdb.syscheck_dec->id = sdb.id1;
+            } else {
+                if(changes > 2 || changes < 0) {
+                    lf->data = NULL;
+                    return(0);
+                } else {
+                    int ids[3] = { sdb.id1, sdb.id2, sdb.id3 };
+                    sdb.syscheck_dec->id = ids[changes];
+                }
+            }
+            if(changes < 4) {
+                changes += 1;
+            }
+
+            sprintf(stmt, "UPDATE files SET previous = csum, csum = ?, changes = ?, date = ? WHERE name = ?;");
+            if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_text(res, 1, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) || 
+                ((error = sqlite3_bind_int(res, 2, changes)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_int(res, 3, lf->time)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_text(res, 4, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
+                ((error = sqlite3_step(res)) != SQLITE_DONE)) {
+                merror("%s: Error updating file %s into database.", ARGV0, f_name);
+                sdb.db_err++;
+                sqlite3_finalize(res);
+                lf->data = NULL;
+                return (0);
+            }
+
+            interpret_changes(f_name, c_sum, saved_sum, lf);
+            return (1);
+        }
+    } else if(res) {
+        sqlite3_finalize(res);
+        merror("%s: Error searching database.", ARGV0);
+        sdb.db_err++;
+        lf->data = NULL;
+        return (0);
+    }
+
+    /* New file */
+    sprintf(stmt, "INSERT INTO files(name, csum, date) VALUES(?, ?, ?)");
+	if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_text(res, 1, f_name, strlen(f_name), NULL)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_text(res, 2, c_sum, strlen(c_sum), NULL)) != SQLITE_OK) ||
+        ((error = sqlite3_bind_int(res, 3, lf->time)) != SQLITE_OK) ||
+        ((error = sqlite3_step(res)) != SQLITE_DONE)) {
+        merror("%s: Error inserting file << %s >> (%zu) with checksum << %s >> (%zu) and date %d into database.",
+               ARGV0, f_name, strlen(f_name), c_sum, strlen(c_sum), lf->time);
+        merror("%s: SQLite database error was: %s", ARGV0, sqlite3_errmsg(db));
+        sdb.db_err++;
+        sqlite3_finalize(res);
+        lf->data = NULL;
+        return (0);
+    }
+    sqlite3_finalize(res);
+
+    /* Alert if configured to notify on new files */
+    if((Config.syscheck_alert_new == 1) && (DB_IsCompleted(agent_id)))
+    {
+        sdb.syscheck_dec->id = sdb.idn;
+
+        /* New file message */
+        snprintf(sdb.comment, OS_MAXSTR,
+                              "New file '%.756s' "
+                              "added to the file system.", f_name);
+
+
+        /* Creating a new log message */
+        free(lf->full_log);
+        os_strdup(sdb.comment, lf->full_log);
+        lf->log = lf->full_log;
+
+
+        /* Setting decoder */
+        lf->decoder_info = sdb.syscheck_dec;
+        lf->data = NULL;
+
+        return(1);
+    }
+
+    lf->data = NULL;
+    return(0);
+}
+
+#endif
 
 /* Special decoder for syscheck
  * Not using the default decoding lib for simplicity

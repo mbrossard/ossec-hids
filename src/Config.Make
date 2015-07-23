@@ -27,3 +27,6 @@ OS_ZLIB = ${PT}os_zlib/os_zlib.c ${PT}external/libz.a
 OS_LINK = ${IEXTRA}
 OS_CJSON = ${PT}external/libcJSON.a -lm
 DBS = cdb/cdb.a
+
+CFLAGS += ${CSQLITE}
+OS_SHARED += ${CSQLITELIB}

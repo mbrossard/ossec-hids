@@ -467,6 +467,7 @@ int _do_print_syscheck(FILE *fp, int all_files, int csv_output)
     return(0);
 }
 
+#ifndef SQLITE
 
 /* Print syscheck db (of modified files. */
 int print_syscheck(char *sk_name, char *sk_ip, char *fname, int print_registry,
@@ -534,6 +535,219 @@ int print_syscheck(char *sk_name, char *sk_ip, char *fname, int print_registry,
     return(0);
 }
 
+#else
+
+#include <sqlite3.h>
+
+/* Print information about a specific file. */
+int _do_print_file_syscheck_sqlite3(sqlite3 *db, char *fname,
+                            int update_counter, int csv_output)
+{
+    int f_found = 0;
+    struct tm *tm_time;
+    char stmt[OS_MAXSTR + 1];
+    sqlite3_stmt *res = NULL;
+    int error = 0;
+    const char *tail;
+
+    if(update_counter) {
+        sprintf(stmt, "SELECT name, csum, previous, date, changes FROM files WHERE name LIKE ? AND changes > 0;");
+        if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) &&
+            ((error = sqlite3_bind_text(res, 1, fname, strlen(fname), NULL)) == SQLITE_OK)) {
+            while((error = sqlite3_step(res)) == SQLITE_ROW) {
+                const char *changed_file_name = (const char *) sqlite3_column_text(res, 0);
+                if(!f_found) {
+                    printf("\n");
+                }
+                printf("**Counter updated for file '%s'\n", changed_file_name);
+                f_found = 1;
+                sqlite3_finalize(res);
+            }
+        }
+
+        if(f_found) {
+            printf("\n");
+            sprintf(stmt, "UPDATE files SET changes = 0 WHERE name LIKE ? AND changes > 0;");
+            if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) != SQLITE_OK) ||
+                ((error = sqlite3_bind_text(res, 1, fname, strlen(fname), NULL)) != SQLITE_OK) ||
+                ((error = sqlite3_step(res)) != SQLITE_DONE)) {
+                printf("Error saving counter updates\n");
+                sqlite3_finalize(res);
+                return (0);
+            }
+        }
+    } else {
+        sprintf(stmt, "SELECT name, csum, previous, date, changes FROM files WHERE name LIKE ? AND changes > 0;");
+        if (((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) &&
+            ((error = sqlite3_bind_text(res, 1, fname, strlen(fname), NULL)) == SQLITE_OK)) {
+            while((error = sqlite3_step(res)) == SQLITE_ROW) {
+                const char *changed_file_name = (const char *) sqlite3_column_text(res, 0);
+                const char *changed_attrs = (const char *) sqlite3_column_text(res, 1);
+                const char *prev_attrs = (const char *) sqlite3_column_text(res, 2);
+                int change_time = sqlite3_column_int(res, 3);
+                int number_changes = sqlite3_column_int(res, 4);
+                char read_day[24 +1];
+                read_day[24] = '\0';
+
+                f_found = 1;
+
+                tm_time = localtime(&change_time);
+                strftime(read_day, 23, "%Y %h %d %T", tm_time);
+
+                if(!csv_output)
+                    printf("\n%s,%d - %s\n", read_day, number_changes, changed_file_name);
+                else
+                    printf("%s,%s,%d\n", read_day, changed_file_name, number_changes);
+
+                _do_print_attrs_syscheck(prev_attrs, changed_attrs,
+                                         csv_output,
+                                         changed_file_name[0] == '/' ? 0 : 1,
+                                         number_changes);
+
+                sqlite3_finalize(res);
+            }
+        }
+    }
+
+    if(!f_found) {
+        printf("\n** No entries found.\n");
+    }
+
+    return(0);
+}
+
+
+
+/* Print syscheck db (of modified files. */
+int _do_print_syscheck_sqlite3(sqlite3 *db, int all_files, int csv_output)
+{
+    int f_found = 0;
+    struct tm *tm_time;
+    char stmt[OS_MAXSTR + 1];
+    sqlite3_stmt *res = NULL;
+    int error = 0;
+    const char *tail;
+
+    char timestamp[24 + 1];
+    char read_day[24 + 1];
+    char saved_read_day[24 + 1];
+    read_day[24] = '\0';
+    saved_read_day[0] = '\0';
+    saved_read_day[24] = '\0';
+
+    sprintf(stmt, "SELECT name, changes, date FROM files WHERE changes > 0 ORDER BY date;");
+	if((error = sqlite3_prepare_v2(db, stmt, 1000, &res, &tail)) == SQLITE_OK) {
+        while((error = sqlite3_step(res)) == SQLITE_ROW) {
+            const char *file_name = (const char *) sqlite3_column_text(res, 0);
+            int number_changes = sqlite3_column_int(res, 1);
+            time_t change_time = sqlite3_column_int(res, 2);
+
+            f_found = 1;
+
+            tm_time = localtime(&change_time);
+            strftime(timestamp, 23, "%Y %h %d %T", tm_time);
+            if(csv_output) {
+                printf("%s,%s,%d\n", timestamp, file_name, number_changes);
+            } else {
+                strftime(read_day, 23, "%Y %h %d", tm_time);
+                if(strcmp(read_day, saved_read_day) != 0) {
+                    printf("\nChanges for %s:\n", read_day);
+                    strncpy(saved_read_day, read_day, 23);
+                }
+                printf("%s,%d - %s\n", timestamp, number_changes, file_name);
+            }
+            sqlite3_finalize(res);
+        }
+    }
+
+    if(!f_found && !csv_output)
+    {
+        printf("\n** No entries found.\n");
+    }
+
+    return(0);
+}
+
+
+/* Print syscheck db (of modified files. */
+int print_syscheck(char *sk_name, char *sk_ip, char *fname, int print_registry,
+                   int all_files, int csv_output, int update_counter)
+{
+    sqlite3 *db = NULL;
+    char tmp_file[513];
+    tmp_file[512] = '\0';
+
+    if (print_registry) {
+        FILE *fp;
+        /* Printing database for the windows registry. */
+        snprintf(tmp_file, 512, "%s/(%s) %s->syscheck-registry",
+                 SYSCHECK_DIR, sk_name, sk_ip);
+        fp = fopen(tmp_file, "r+");
+        if(fp) {
+            if(!fname) {
+                _do_print_syscheck(fp, all_files, csv_output);
+            } else {
+                _do_print_file_syscheck(fp, fname, update_counter, csv_output);
+            }
+            fclose(fp);
+        }
+        return 0;
+    }
+
+    if(sk_name == NULL) {
+        snprintf(tmp_file, 512, "%s/syscheck.sqlite3", SYSCHECK_DIR);
+    } else if(sk_ip == NULL) {
+        snprintf(tmp_file, 512, "%s/%s->syscheck.sqlite3",SYSCHECK_DIR, sk_name);
+    } else if(!print_registry) {
+         snprintf(tmp_file, 512, "%s/(%s) %s->syscheck", SYSCHECK_DIR, sk_name, sk_ip);
+    }
+
+    sqlite3_open(tmp_file, &db);
+
+    if(!fname) {
+        _do_print_syscheck_sqlite3(db, all_files, csv_output);
+    } else {
+        _do_print_file_syscheck_sqlite3(db, fname, update_counter, csv_output);
+    }
+
+    return(0);
+}
+
+/* Delete syscheck db */
+int delete_syscheck(char *sk_name, char *sk_ip, int full_delete)
+{
+    FILE *fp;
+    char tmp_file[513];
+
+    tmp_file[512] = '\0';
+
+    /* Deleting related files */
+    snprintf(tmp_file, 512, "%s/(%s) %s->syscheck.sqlite3",
+             SYSCHECK_DIR, sk_name, sk_ip);
+    unlink(tmp_file);
+
+
+    /* Deleting cpt files */
+    snprintf(tmp_file, 512, "%s/.(%s) %s->syscheck.cpt",
+             SYSCHECK_DIR, sk_name, sk_ip);
+    unlink(tmp_file);
+
+
+    /* Deleting registry entries */
+    snprintf(tmp_file, 512, "%s/(%s) %s->syscheck-registry",
+             SYSCHECK_DIR, sk_name, sk_ip);
+    unlink(tmp_file);
+
+
+    /* Deleting cpt files */
+    snprintf(tmp_file, 512, "%s/.(%s) %s->syscheck-registry.cpt",
+             SYSCHECK_DIR, sk_name, sk_ip);
+    unlink(tmp_file);
+
+    return(1);
+}
+
+#endif
 
 
 int _do_get_rootcheckscan(FILE *fp)
@@ -790,6 +1004,8 @@ int print_rootcheck(char *sk_name, char *sk_ip, char *fname, int resolved,
 #endif
 
 
+#ifndef SQLITE
+
 /* Delete syscheck db */
 int delete_syscheck(char *sk_name, char *sk_ip, int full_delete)
 {
@@ -851,6 +1067,7 @@ int delete_syscheck(char *sk_name, char *sk_ip, int full_delete)
     return(1);
 }
 
+#endif
 
 
 /* Delete rootcheck db */

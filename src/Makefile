@@ -79,6 +79,10 @@ setgeoip:
 		@echo "CGEOIP=-DGEOIP" >> ./Config.OS
 		@echo "CGEOIPLIB=-I/usr/local/include -L/usr/local/lib -lGeoIP" >> ./Config.OS
 
+setsqlite:
+		@echo "CSQLITE=-DSQLITE" >> ./Config.OS
+		@echo "CSQLITELIB=-lsqlite3" >> ./Config.OS
+
 setdb:
 		@cd ./os_dbd; echo "CDB=`./dbmake.sh`" >> ../Config.OS;
 setmaxagents:
